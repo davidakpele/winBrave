@@ -10,7 +10,6 @@ import faulthandler
 import numpy as np
 faulthandler.enable()
 
-from PIL import Image
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QComboBox, QSpinBox, QTextEdit, QFileDialog,
@@ -29,8 +28,8 @@ class PersonDialog(QDialog):
     def __init__(self, parent=None, person_id: int = None):
         super().__init__(parent)
         print(f"DEBUG: PersonDialog init, person_id={person_id}")
-        self._person_id = person_id
-        self._photo_bytes = None
+        self._person_id   = person_id
+        self._photo_bytes = None   # raw original bytes — NOT resized
         self._build_ui()
         if person_id:
             self._load_record(person_id)
@@ -157,19 +156,13 @@ class PersonDialog(QDialog):
         )
         if not path:
             return
+
+        # Read original bytes — do NOT resize or recompress
+        # The face engine needs the full-resolution image for accurate detection
         with open(path, 'rb') as f:
-            raw = f.read()
-        print(f"DEBUG: photo loaded {len(raw)} bytes")
-        try:
-            img = Image.open(io.BytesIO(raw)).convert("RGB")
-            img.thumbnail((300, 300), Image.LANCZOS)
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=85)
-            self._photo_bytes = buf.getvalue()
-            print(f"DEBUG: photo resized OK {len(self._photo_bytes)} bytes")
-        except Exception as e:
-            print(f"DEBUG: resize error: {e}")
-            self._photo_bytes = raw
+            self._photo_bytes = f.read()
+
+        print(f"DEBUG: photo loaded {len(self._photo_bytes)} bytes from {os.path.basename(path)}")
         self.photo_lbl.set_photo_bytes(self._photo_bytes)
 
     def _load_record(self, person_id: int):
@@ -197,9 +190,8 @@ class PersonDialog(QDialog):
 
     def _save(self):
         print("DEBUG: _save started")
-        name = self.name_edit.text().strip()
+        name   = self.name_edit.text().strip()
         id_num = self.id_edit.text().strip()
-        print(f"DEBUG: name={name}, id={id_num}")
 
         if not name or not id_num:
             QMessageBox.warning(self, "Validation", "Full Name and ID Number are required.")
@@ -218,17 +210,22 @@ class PersonDialog(QDialog):
             'photo_blob':  self._photo_bytes,
             'encoding':    None,
         }
-        print("DEBUG: data dict built")
 
         if self._photo_bytes:
-            print("DEBUG: computing face encoding via OpenCV engine...")
+            print("DEBUG: computing face encoding on original full-res image...")
             try:
                 enc = encode_face_from_bytes(self._photo_bytes)
                 if enc is not None:
                     data['encoding'] = pickle.dumps(enc)
                     print(f"DEBUG: encoding OK, vector size={len(enc)}")
                 else:
-                    print("DEBUG: no face detected, saving without encoding")
+                    print("DEBUG: no face detected — saving record without encoding")
+                    QMessageBox.information(
+                        self, "No Face Detected",
+                        "No face was detected in this photo.\n"
+                        "The record will be saved without a face encoding.\n\n"
+                        "For face search to work, use a clear frontal photo."
+                    )
             except Exception as e:
                 print(f"DEBUG: encoding error (non-fatal): {e}")
                 traceback.print_exc()
@@ -248,7 +245,7 @@ class PersonDialog(QDialog):
                     )
                     conn.commit()
                     conn.close()
-                    print("DEBUG: photo/encoding updated")
+                    print("DEBUG: photo/encoding updated in DB")
             else:
                 print("DEBUG: inserting new record")
                 add_person(data)
@@ -261,4 +258,3 @@ class PersonDialog(QDialog):
 
         print("DEBUG: calling accept()")
         self.accept()
-        print("DEBUG: done")
