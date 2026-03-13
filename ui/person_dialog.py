@@ -1,27 +1,43 @@
 """
 ui/person_dialog.py
 Dialog for adding a new person or editing an existing record.
+Updated for new face_engine API: encode_face_from_bytes returns (vec, box).
 """
 import os
-import io
 import pickle
 import traceback
 import faulthandler
-import numpy as np
 faulthandler.enable()
 
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QComboBox, QSpinBox, QTextEdit, QFileDialog,
-    QGridLayout, QGroupBox, QFrame, QSizePolicy, QMessageBox
+    QGroupBox, QFrame, QSizePolicy, QMessageBox
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QObject, QEvent
 from .styles import *
 from .widgets import PhotoLabel
 from core.face_engine import encode_face_from_bytes
-from database.db_manager import get_person_by_id, update_person, add_person, get_connection
+from database.db_manager import get_person_by_id, update_person, add_person
 
 print("DEBUG: person_dialog imports OK")
+
+
+class _ClickFilter(QObject):
+    """
+    Safe PyQt6 click detection via installEventFilter.
+    Avoids the hard segfault caused by monkey-patching mousePressEvent
+    on C++ Qt widgets in PyQt6.
+    """
+    def __init__(self, callback):
+        super().__init__()
+        self._cb = callback
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.MouseButtonRelease:
+            self._cb()
+            return True
+        return False
 
 
 class PersonDialog(QDialog):
@@ -29,13 +45,14 @@ class PersonDialog(QDialog):
         super().__init__(parent)
         print(f"DEBUG: PersonDialog init, person_id={person_id}")
         self._person_id   = person_id
-        self._photo_bytes = None   # raw original bytes — NOT resized
+        self._photo_bytes = None
         self._build_ui()
         if person_id:
             self._load_record(person_id)
         self.setWindowTitle("Edit Record" if person_id else "New Record")
         self.setMinimumSize(560, 600)
         self.setStyleSheet(f"background-color: {BG_DARK}; color: {TEXT_PRIMARY};")
+        print("DEBUG: PersonDialog init complete")
 
     def _build_ui(self):
         root = QVBoxLayout(self)
@@ -43,17 +60,23 @@ class PersonDialog(QDialog):
         root.setSpacing(12)
 
         title = QLabel("▮  PERSON RECORD" if not self._person_id else "▮  EDIT RECORD")
-        title.setStyleSheet(f"color: {ACCENT_BLUE}; font-size: 13px; font-weight: bold; letter-spacing: 2px; background: transparent; border: none;")
+        title.setStyleSheet(
+            f"color: {ACCENT_BLUE}; font-size: 13px; font-weight: bold; "
+            f"letter-spacing: 2px; background: transparent; border: none;"
+        )
         root.addWidget(title)
 
         cols = QHBoxLayout()
         cols.setSpacing(16)
 
+        # ── Photo column ──────────────────────────────────────────────────────
         photo_col = QVBoxLayout()
         photo_col.setSpacing(8)
+
         self.photo_lbl = PhotoLabel("CLICK\nTO ADD\nPHOTO", (160, 190))
         self.photo_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.photo_lbl.mousePressEvent = lambda e: self._pick_photo()
+        self._photo_filter = _ClickFilter(self._pick_photo)   # keep ref!
+        self.photo_lbl.installEventFilter(self._photo_filter)
         photo_col.addWidget(self.photo_lbl)
 
         pick_btn = QPushButton("SELECT PHOTO")
@@ -62,12 +85,16 @@ class PersonDialog(QDialog):
         photo_col.addStretch()
         cols.addLayout(photo_col)
 
+        # ── Fields column ─────────────────────────────────────────────────────
         fields_col = QVBoxLayout()
         fields_col.setSpacing(8)
 
         def field(label, widget):
             lbl = QLabel(label)
-            lbl.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 10px; letter-spacing: 1px; background: transparent; border: none;")
+            lbl.setStyleSheet(
+                f"color: {TEXT_SECONDARY}; font-size: 10px; "
+                f"letter-spacing: 1px; background: transparent; border: none;"
+            )
             fields_col.addWidget(lbl)
             fields_col.addWidget(widget)
 
@@ -88,7 +115,10 @@ class PersonDialog(QDialog):
         age_gender.addWidget(self.age_spin, 1)
         age_gender.addWidget(self.gender_combo, 1)
         lbl2 = QLabel("AGE / GENDER")
-        lbl2.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 10px; letter-spacing: 1px; background: transparent; border: none;")
+        lbl2.setStyleSheet(
+            f"color: {TEXT_SECONDARY}; font-size: 10px; "
+            f"letter-spacing: 1px; background: transparent; border: none;"
+        )
         fields_col.addWidget(lbl2)
         fields_col.addLayout(age_gender)
 
@@ -115,18 +145,29 @@ class PersonDialog(QDialog):
         cols.addLayout(fields_col, 1)
         root.addLayout(cols)
 
+        # ── Notes ─────────────────────────────────────────────────────────────
         notes_lbl = QLabel("CASE NOTES")
-        notes_lbl.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 10px; letter-spacing: 1px; background: transparent; border: none;")
+        notes_lbl.setStyleSheet(
+            f"color: {TEXT_SECONDARY}; font-size: 10px; "
+            f"letter-spacing: 1px; background: transparent; border: none;"
+        )
         root.addWidget(notes_lbl)
         self.notes_edit = QTextEdit()
         self.notes_edit.setFixedHeight(80)
         root.addWidget(self.notes_edit)
 
-        enc_lbl = QLabel("ℹ  If a photo is provided, face encoding will be computed automatically on save.")
-        enc_lbl.setStyleSheet(f"color: {TEXT_DIM}; font-size: 10px; background: transparent; border: none;")
+        enc_lbl = QLabel(
+            "ℹ  Face encoding is computed automatically on save. "
+            "For best results use a clear, well-lit frontal photo."
+        )
+        enc_lbl.setStyleSheet(
+            f"color: {TEXT_DIM}; font-size: 10px; "
+            f"background: transparent; border: none;"
+        )
         enc_lbl.setWordWrap(True)
         root.addWidget(enc_lbl)
 
+        # ── Buttons ───────────────────────────────────────────────────────────
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         cancel_btn = QPushButton("CANCEL")
@@ -139,7 +180,7 @@ class PersonDialog(QDialog):
                 print("DEBUG: save button clicked")
                 self._save()
             except Exception as e:
-                print("DEBUG: unhandled crash")
+                print(f"DEBUG: unhandled crash in _save: {e}")
                 traceback.print_exc()
                 QMessageBox.critical(self, "Crash", str(e))
 
@@ -156,19 +197,17 @@ class PersonDialog(QDialog):
         )
         if not path:
             return
-
-        # Read original bytes — do NOT resize or recompress
-        # The face engine needs the full-resolution image for accurate detection
         with open(path, 'rb') as f:
             self._photo_bytes = f.read()
-
-        print(f"DEBUG: photo loaded {len(self._photo_bytes)} bytes from {os.path.basename(path)}")
+        print(f"DEBUG: photo loaded {len(self._photo_bytes)} bytes  "
+              f"file={os.path.basename(path)}")
         self.photo_lbl.set_photo_bytes(self._photo_bytes)
 
     def _load_record(self, person_id: int):
-        print(f"DEBUG: loading record {person_id}")
+        print(f"DEBUG: loading record id={person_id}")
         rec = get_person_by_id(person_id)
         if not rec:
+            print("DEBUG: record not found")
             return
         self.name_edit.setText(rec.get('full_name', ''))
         self.id_edit.setText(rec.get('id_number', ''))
@@ -194,7 +233,8 @@ class PersonDialog(QDialog):
         id_num = self.id_edit.text().strip()
 
         if not name or not id_num:
-            QMessageBox.warning(self, "Validation", "Full Name and ID Number are required.")
+            QMessageBox.warning(self, "Validation",
+                                "Full Name and ID Number are required.")
             return
 
         data = {
@@ -212,19 +252,21 @@ class PersonDialog(QDialog):
         }
 
         if self._photo_bytes:
-            print("DEBUG: computing face encoding on original full-res image...")
+            print("DEBUG: computing face encoding (multi-scale, aligned)...")
             try:
-                enc = encode_face_from_bytes(self._photo_bytes)
+                # encode_face_from_bytes now returns (vector, bounding_box)
+                enc, box = encode_face_from_bytes(self._photo_bytes)
                 if enc is not None:
                     data['encoding'] = pickle.dumps(enc)
-                    print(f"DEBUG: encoding OK, vector size={len(enc)}")
+                    print(f"DEBUG: encoding OK  dim={len(enc)}  box={box}")
                 else:
-                    print("DEBUG: no face detected — saving record without encoding")
+                    print("DEBUG: no face detected — saving without encoding")
                     QMessageBox.information(
                         self, "No Face Detected",
                         "No face was detected in this photo.\n"
                         "The record will be saved without a face encoding.\n\n"
-                        "For face search to work, use a clear frontal photo."
+                        "For face search to work, please use a clear,\n"
+                        "well-lit photo where the face is visible."
                     )
             except Exception as e:
                 print(f"DEBUG: encoding error (non-fatal): {e}")
@@ -237,24 +279,16 @@ class PersonDialog(QDialog):
             if self._person_id:
                 print(f"DEBUG: updating record id={self._person_id}")
                 update_person(self._person_id, data)
-                if self._photo_bytes:
-                    conn = get_connection()
-                    conn.execute(
-                        "UPDATE persons SET photo_blob=?, encoding=? WHERE id=?",
-                        (self._photo_bytes, data['encoding'], self._person_id)
-                    )
-                    conn.commit()
-                    conn.close()
-                    print("DEBUG: photo/encoding updated in DB")
+                print("DEBUG: record updated OK")
             else:
                 print("DEBUG: inserting new record")
                 add_person(data)
-                print("DEBUG: inserted OK")
+                print("DEBUG: new record inserted OK")
         except Exception as e:
-            print(f"DEBUG: DB error: {e}")
+            print(f"DEBUG: database error: {e}")
             traceback.print_exc()
             QMessageBox.critical(self, "Save Error", str(e))
             return
 
-        print("DEBUG: calling accept()")
+        print("DEBUG: calling self.accept()")
         self.accept()
