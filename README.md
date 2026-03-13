@@ -2,22 +2,24 @@
 
 A desktop facial recognition search application built with PyQt6, designed for security research and learning.
 
-## Screenshot
-Matches the dark tactical UI from the reference mockup — with face scan animation, match cards, confidence bars, status badges, and a full record detail panel.
-
 ---
 
 ## Features
 
 | Feature | Details |
 |---|---|
-| **Face Search** | Upload a photo → encode biometrics → search local DB |
+| **Face Search** | Upload a photo → detect face → embed face crop → search local DB |
+| **Deep Face Scan** | Scan animation locks onto the detected face region only — dims everything outside it |
+| **5-Second Countdown** | Biometric matching delay with live countdown badge on the scan overlay |
 | **Text Search** | Search by name, ID, nationality, status, address, notes |
+| **Match Rating** | Results rated as EXACT / STRONG / CLOSE / POSSIBLE MATCH with colour coding |
+| **Confidence & Diff** | Each result shows Match % and Diff % (e.g. Match 82.4% · Diff 17.6%) |
 | **Match Cards** | Sorted by confidence, with status colour-coding |
 | **Detail Panel** | Full biographic view, case notes, actions |
 | **Add / Edit / Delete** | Full CRUD on person records |
-| **Auto Encoding** | Face encoding computed on photo upload |
-| **Dark Tactical UI** | Scan-line animation, pulsing dots, confidence bars |
+| **Auto Encoding** | Face encoding computed on photo upload — face crop only, not full image |
+| **65% Minimum Match** | Hard floor — results below 65% confidence are never returned |
+| **Dark Tactical UI** | Scan-line animation, pulsing dots, confidence bars, rating banners |
 | **Local SQLite DB** | All data stays on your machine |
 
 ---
@@ -30,14 +32,18 @@ facerec/
 ├── requirements.txt
 ├── setup_windows.bat       # One-click Windows installer
 ├── facerec.db              # Created automatically on first run
+├── models/                 # Downloaded automatically on first run
+│   ├── deploy.prototxt
+│   ├── res10_300x300_ssd_iter_140000.caffemodel
+│   └── openface.nn4.small2.v1.t7
 ├── core/
-│   └── face_engine.py      # face_recognition wrapper
+│   └── face_engine.py      # OpenCV DNN face detection + OpenFace embedding
 ├── database/
 │   └── db_manager.py       # SQLite CRUD layer
 └── ui/
     ├── main_window.py      # Root window + menu
-    ├── search_panel.py     # Left: image upload + controls
-    ├── results_panel.py    # Centre: match cards
+    ├── search_panel.py     # Left: image upload, deep scan animation, controls
+    ├── results_panel.py    # Centre: match cards + rating banner
     ├── detail_panel.py     # Right: record detail
     ├── person_dialog.py    # Add/Edit dialog
     ├── widgets.py          # PhotoLabel, MatchCard, StatusBadge, etc.
@@ -50,28 +56,15 @@ facerec/
 
 ### Prerequisites
 - Python 3.10 or 3.11 (recommended)
-- [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with **C++ workload** — required for dlib
+- OpenCV and NumPy (no dlib or face_recognition required)
 
 ### Quick Setup
 ```bat
-setup_windows.bat
+pip install PyQt6 opencv-python numpy Pillow
 ```
 
-### Manual Setup
-```bat
-pip install cmake
-pip install dlib           # see note below if this fails
-pip install face_recognition PyQt6 opencv-python numpy Pillow
-```
-
-#### If dlib fails to build on Windows:
-Download a prebuilt `.whl` for your Python version from:
-https://github.com/z-mahmud22/Dlib_Windows_Python3.x
-
-Then install it:
-```bat
-pip install dlib-19.24.1-cp311-cp311-win_amd64.whl
-```
+### Model Download
+Face detection and embedding models are downloaded automatically on first launch into the `models/` folder. No manual steps required. If a download fails, run the app again and it will retry.
 
 ---
 
@@ -86,21 +79,40 @@ python main.py
 ## How to Use
 
 ### Face Search
-1. Click the photo zone in the left panel (or drag & drop)
-2. Select a query image (clear frontal face photo)
+1. Click the photo zone in the left panel (or use **SELECT PHOTO**)
+2. Select a query image — use a clear, well-lit frontal face photo
 3. Adjust the **tolerance slider** (lower = stricter matching)
-4. Click **RUN FACE SEARCH**
-5. Matching records appear in the centre panel
-6. Click any card to view full details on the right
+4. Click **▶ RUN FACE SEARCH**
+5. The scan runs in two phases:
+   - **Phase 1 — Full scan:** cyan grid sweeps the whole image while the face is located
+   - **Phase 2 — Deep scan:** the overlay locks onto the face region, dims the surroundings, and runs a focused green scan inside the face box only
+6. A 5-second countdown runs while biometrics are matched against the database
+7. Results appear in the centre panel with a rating banner
+
+### Reading Match Results
+
+The rating banner above the result cards shows:
+
+| Rating | Confidence | Colour |
+|---|---|---|
+| EXACT MATCH | 92%+ | Green |
+| STRONG MATCH | 82–91% | Green |
+| CLOSE MATCH | 75–81% | Yellow |
+| POSSIBLE MATCH | 65–74% | Orange |
+
+Below the label, the banner shows e.g. `Match  82.4%  ·  Diff  17.6%`.
+
+Results below **65% confidence** are never shown regardless of the tolerance slider setting.
 
 ### Text Search
 - Type a name, ID number, nationality, or status in the **Text Search** box
-- Press Enter or click **Search Database**
+- Press Enter or click **SEARCH DATABASE**
 
 ### Adding Records
-- Click **+ NEW RECORD** in the title bar (or File → New Record)
+- Click **+ NEW RECORD** in the title bar
 - Fill in the form and select a photo
-- The face encoding is computed automatically when a photo is provided
+- The face encoding is computed automatically from the face crop of the uploaded photo
+- If no face is detected in the photo, the record is saved without an encoding (it will not appear in face search results)
 
 ### Status Codes
 
@@ -118,10 +130,26 @@ python main.py
 
 ## Architecture Notes
 
-- **`core/face_engine.py`** — All face_recognition calls are isolated here. The engine is lazily imported so the app launches even if libraries aren't installed yet.
-- **`database/db_manager.py`** — Pure SQLite; no ORM dependency. Face encodings are stored as pickled numpy arrays in a BLOB column.
-- **Thread safety** — Face search runs in a `QThread` worker to keep the UI responsive during heavy biometric computation.
-- **Tolerance** — The default 0.55 is a good balance. Lower (0.40) = fewer false positives. Higher (0.65) = more permissive matching.
+### Face Engine (`core/face_engine.py`)
+The engine uses **OpenCV DNN** for two tasks:
+
+1. **Detection** — ResNet SSD (`res10_300x300_ssd_iter_140000.caffemodel`) locates the face bounding box in the image. The image is scaled to 600px on its longest side before detection for accuracy. A minimum detector confidence of 50% is required.
+
+2. **Embedding** — The detected face crop (with 10% padding) is passed to the **OpenFace** network (`openface.nn4.small2.v1.t7`) which produces a 128-dimensional vector representing the face. The full image is never passed to the embedder — only the cropped face region.
+
+Matching uses **cosine distance** between stored and query embeddings. The hard minimum of 65% confidence cannot be bypassed by the tolerance slider.
+
+### Encoding Storage
+Face encodings are stored as pickled NumPy arrays in a BLOB column in SQLite. Both pickled bytes and raw NumPy arrays are handled during matching for backward compatibility.
+
+### Thread Safety
+Face search runs in a `QThread` worker to keep the UI responsive. The worker emits Qt signals to update the scan overlay and countdown badge from the main thread safely.
+
+### PyQt6 Compatibility
+`mousePressEvent` is **not** monkey-patched on any widget. PyQt6 is stricter than PyQt5 — overriding C++ virtual methods via instance assignment causes a hard segfault. All click detection uses `installEventFilter` with a `QObject` subclass (`_ClickFilter`) stored as an instance attribute to prevent garbage collection.
+
+### Tolerance Slider
+The slider range is 0.30–0.75 (cosine distance). Lower values require faces to be more similar before a match is returned. The 65% confidence hard floor applies regardless of slider position.
 
 ---
 
