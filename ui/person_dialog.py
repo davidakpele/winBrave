@@ -44,8 +44,10 @@ class PersonDialog(QDialog):
     def __init__(self, parent=None, person_id: int = None):
         super().__init__(parent)
         print(f"DEBUG: PersonDialog init, person_id={person_id}")
-        self._person_id   = person_id
-        self._photo_bytes = None
+        self._person_id      = person_id
+        self._photo_bytes    = None
+        self._photo_changed  = False   # True only when user picks a NEW photo
+        self._existing_enc   = None    # encoding blob already in DB (edit mode)
         self._build_ui()
         if person_id:
             self._load_record(person_id)
@@ -198,7 +200,8 @@ class PersonDialog(QDialog):
         if not path:
             return
         with open(path, 'rb') as f:
-            self._photo_bytes = f.read()
+            self._photo_bytes   = f.read()
+            self._photo_changed = True   # user explicitly picked a new photo
         print(f"DEBUG: photo loaded {len(self._photo_bytes)} bytes  "
               f"file={os.path.basename(path)}")
         self.photo_lbl.set_photo_bytes(self._photo_bytes)
@@ -223,8 +226,14 @@ class PersonDialog(QDialog):
             self.status_combo.setCurrentIndex(idx2)
         self.notes_edit.setPlainText(rec.get('notes', ''))
         if rec.get('photo_blob'):
-            self._photo_bytes = rec['photo_blob']
+            # SQLite can return memoryview or sqlite3.Binary — always normalise to plain bytes
+            raw = rec['photo_blob']
+            self._photo_bytes   = bytes(raw) if not isinstance(raw, bytes) else raw
+            self._photo_changed = False   # loaded from DB — not a new pick
             self.photo_lbl.set_photo_bytes(self._photo_bytes)
+        if rec.get('encoding'):
+            raw_enc = rec['encoding']
+            self._existing_enc = bytes(raw_enc) if not isinstance(raw_enc, bytes) else raw_enc
         print("DEBUG: record loaded OK")
 
     def _save(self):
@@ -248,19 +257,19 @@ class PersonDialog(QDialog):
             'status':      self.status_combo.currentText(),
             'notes':       self.notes_edit.toPlainText().strip(),
             'photo_blob':  self._photo_bytes,
-            'encoding':    None,
+            'encoding':    self._existing_enc,   # default: keep existing encoding
         }
 
-        if self._photo_bytes:
-            print("DEBUG: computing face encoding (multi-scale, aligned)...")
+        if self._photo_bytes and self._photo_changed:
+            # User picked a NEW photo — re-encode from scratch
+            print("DEBUG: new photo selected, computing face encoding...")
             try:
-                # encode_face_from_bytes now returns (vector, bounding_box)
                 enc, box = encode_face_from_bytes(self._photo_bytes)
                 if enc is not None:
                     data['encoding'] = pickle.dumps(enc)
                     print(f"DEBUG: encoding OK  dim={len(enc)}  box={box}")
                 else:
-                    print("DEBUG: no face detected — saving without encoding")
+                    print("DEBUG: no face detected — saving photo without encoding")
                     QMessageBox.information(
                         self, "No Face Detected",
                         "No face was detected in this photo.\n"
@@ -268,17 +277,44 @@ class PersonDialog(QDialog):
                         "For face search to work, please use a clear,\n"
                         "well-lit photo where the face is visible."
                     )
+                    data['encoding'] = None   # wipe old encoding — photo changed but no face
             except Exception as e:
                 print(f"DEBUG: encoding error (non-fatal): {e}")
                 traceback.print_exc()
+        elif not self._photo_bytes:
+            print("DEBUG: no photo at all, skipping encoding")
+            data['encoding'] = None
         else:
-            print("DEBUG: no photo, skipping encoding")
+            print("DEBUG: photo unchanged — keeping existing encoding")
 
         print("DEBUG: saving to database...")
         try:
             if self._person_id:
                 print(f"DEBUG: updating record id={self._person_id}")
                 update_person(self._person_id, data)
+
+                # ── Guaranteed photo + encoding save ──────────────────────────
+                # update_person may or may not include photo_blob in its SQL.
+                # We do a direct targeted UPDATE here to make absolutely sure
+                # the photo and encoding are persisted on every edit save.
+                if self._photo_bytes is not None:
+                    from database.db_manager import get_connection as get_db_connection
+                    try:
+                        conn = get_db_connection()
+                        conn.execute(
+                            "UPDATE persons SET photo_blob=?, encoding=? WHERE id=?",
+                            (
+                                self._photo_bytes,
+                                data.get('encoding'),
+                                self._person_id,
+                            )
+                        )
+                        conn.commit()
+                        print("DEBUG: photo_blob + encoding force-saved OK")
+                    except Exception as db_e:
+                        print(f"DEBUG: force-save photo failed: {db_e}")
+                        traceback.print_exc()
+
                 print("DEBUG: record updated OK")
             else:
                 print("DEBUG: inserting new record")

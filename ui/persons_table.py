@@ -16,7 +16,6 @@ PAGE_SIZE = 50
 
 
 class PersonsTablePanel(QWidget):
-    open_edit   = pyqtSignal(int)
     open_detail = pyqtSignal(int)
 
     def __init__(self, parent=None):
@@ -307,9 +306,8 @@ class PersonsTablePanel(QWidget):
     def _edit_record(self, person_id: int):
         from .person_dialog import PersonDialog
         dlg = PersonDialog(self, person_id)
-        if dlg.exec():
-            self.refresh()
-        self.open_edit.emit(person_id)
+        dlg.exec()
+        self.refresh()  # always refresh whether saved or cancelled
 
     def _delete_record(self, person_id: int):
         reply = QMessageBox.question(

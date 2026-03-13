@@ -266,7 +266,7 @@ class MainWindow(QMainWindow):
         self.detail_panel.open_edit.connect(self._edit_record)
         self.detail_panel.deleted.connect(self._on_deleted)
 
-        self.persons_table.open_edit.connect(self._edit_record)
+        # persons_table handles its own edit dialog internally — no open_edit signal
         self.persons_table.open_detail.connect(self._on_person_selected)
 
     def _start_clock(self):
