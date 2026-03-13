@@ -1,94 +1,109 @@
 """
 core/face_engine.py
-Face detection, encoding, and matching engine.
-Uses face_recognition (dlib) for biometric analysis.
+Face detection and recognition engine using OpenCV DNN.
+No dlib or face_recognition package required.
 """
-import numpy as np
+import io
+import os
 import pickle
+import urllib.request
+import numpy as np
+import cv2
+from PIL import Image
 from typing import Optional, List, Tuple, Dict
-from pathlib import Path
-
-# Lazy imports — allows the app to start even if libraries aren't installed yet
-_face_recognition = None
-_cv2 = None
-_PIL_Image = None
 
 
-def _import_deps():
-    global _face_recognition, _cv2, _PIL_Image
-    if _face_recognition is None:
-        try:
-            import face_recognition as fr
-            _face_recognition = fr
-        except ImportError:
-            raise ImportError(
-                "face_recognition is not installed.\n"
-                "Run:  pip install face_recognition\n"
-                "Also requires cmake + Visual Studio Build Tools on Windows."
-            )
-    if _cv2 is None:
-        try:
-            import cv2
-            _cv2 = cv2
-        except ImportError:
-            raise ImportError("opencv-python is not installed.\nRun: pip install opencv-python")
-    if _PIL_Image is None:
-        try:
-            from PIL import Image
-            _PIL_Image = Image
-        except ImportError:
-            raise ImportError("Pillow is not installed.\nRun: pip install Pillow")
+# ── Model paths ────────────────────────────────────────────────────────────────
+_MODEL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models")
+_DETECTOR_PROTO  = os.path.join(_MODEL_DIR, "deploy.prototxt")
+_DETECTOR_MODEL  = os.path.join(_MODEL_DIR, "res10_300x300_ssd_iter_140000.caffemodel")
+_RECOGNIZER_MODEL = os.path.join(_MODEL_DIR, "openface.nn4.small2.v1.t7")
+
+_DETECTOR   = None
+_RECOGNIZER = None
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Public API
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Model download URLs ────────────────────────────────────────────────────────
+_URLS = {
+    _DETECTOR_PROTO: "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt",
+    _DETECTOR_MODEL: "https://github.com/opencv/opencv_3rdparty/raw/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel",
+    _RECOGNIZER_MODEL: "https://storage.cmusatyalab.org/openface-models/nn4.small2.v1.t7",
+}
 
-def encode_face_from_path(image_path: str) -> Optional[np.ndarray]:
-    """Load an image file and return the first face encoding found, or None."""
-    _import_deps()
-    image = _face_recognition.load_image_file(image_path)
-    encodings = _face_recognition.face_encodings(image)
-    return encodings[0] if encodings else None
+
+def _ensure_models():
+    """Download models if not present."""
+    os.makedirs(_MODEL_DIR, exist_ok=True)
+    for path, url in _URLS.items():
+        if not os.path.exists(path):
+            print(f"Downloading model: {os.path.basename(path)} ...")
+            urllib.request.urlretrieve(url, path)
+            print(f"Downloaded: {os.path.basename(path)}")
+
+
+def _load_models():
+    global _DETECTOR, _RECOGNIZER
+    if _DETECTOR is None:
+        _ensure_models()
+        _DETECTOR = cv2.dnn.readNetFromCaffe(_DETECTOR_PROTO, _DETECTOR_MODEL)
+    if _RECOGNIZER is None:
+        _RECOGNIZER = cv2.dnn.readNetFromTorch(_RECOGNIZER_MODEL)
+
+
+# ── Core functions ─────────────────────────────────────────────────────────────
+
+def detect_face_locations(rgb_array: np.ndarray, confidence_thresh: float = 0.5) -> List[Tuple[int, int, int, int]]:
+    """Detect faces. Returns list of (top, right, bottom, left) tuples."""
+    _load_models()
+    h, w = rgb_array.shape[:2]
+    blob = cv2.dnn.blobFromImage(rgb_array, 1.0, (300, 300), (104.0, 177.0, 123.0))
+    _DETECTOR.setInput(blob)
+    detections = _DETECTOR.forward()
+    locations = []
+    for i in range(detections.shape[2]):
+        conf = detections[0, 0, i, 2]
+        if conf > confidence_thresh:
+            box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+            x1, y1, x2, y2 = box.astype(int)
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
+            locations.append((y1, x2, y2, x1))  # top, right, bottom, left
+    return locations
+
+
+def encode_face(rgb_array: np.ndarray) -> Optional[np.ndarray]:
+    """Return 128-d face embedding for the first detected face, or None."""
+    _load_models()
+    locations = detect_face_locations(rgb_array)
+    if not locations:
+        return None
+    top, right, bottom, left = locations[0]
+    face_roi = rgb_array[top:bottom, left:right]
+    if face_roi.size == 0:
+        return None
+    blob = cv2.dnn.blobFromImage(face_roi, 1.0 / 255, (96, 96), (0, 0, 0), swapRB=True, crop=False)
+    _RECOGNIZER.setInput(blob)
+    embedding = _RECOGNIZER.forward()
+    vec = embedding[0]
+    norm = np.linalg.norm(vec)
+    return vec / norm if norm > 0 else vec
 
 
 def encode_face_from_bytes(image_bytes: bytes) -> Optional[np.ndarray]:
-    """Encode a face from raw image bytes (e.g., from a file dialog)."""
-    _import_deps()
-    import io
-    img = _PIL_Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    img_array = np.array(img)
-    encodings = _face_recognition.face_encodings(img_array)
-    return encodings[0] if encodings else None
+    """Encode face from raw image bytes."""
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    return encode_face(np.array(img))
 
 
-def encode_face_from_array(rgb_array: np.ndarray) -> Optional[np.ndarray]:
-    """Encode from a numpy RGB array (e.g., from webcam frame)."""
-    _import_deps()
-    encodings = _face_recognition.face_encodings(rgb_array)
-    return encodings[0] if encodings else None
+def encode_face_from_path(image_path: str) -> Optional[np.ndarray]:
+    """Encode face from file path."""
+    img = Image.open(image_path).convert("RGB")
+    return encode_face(np.array(img))
 
 
-def detect_faces(rgb_array: np.ndarray) -> List[Tuple[int, int, int, int]]:
-    """Return list of face bounding boxes (top, right, bottom, left)."""
-    _import_deps()
-    return _face_recognition.face_locations(rgb_array)
-
-
-def compare_faces(
-    known_encodings: List[np.ndarray],
-    unknown_encoding: np.ndarray,
-    tolerance: float = 0.55
-) -> Tuple[List[bool], List[float]]:
-    """
-    Compare an unknown encoding against a list of known encodings.
-    Returns (matches_list, distance_list).
-    Lower distance = better match. Typical threshold ≤ 0.55.
-    """
-    _import_deps()
-    matches = _face_recognition.compare_faces(known_encodings, unknown_encoding, tolerance=tolerance)
-    distances = _face_recognition.face_distance(known_encodings, unknown_encoding)
-    return matches, distances.tolist()
+def compare_encodings(enc1: np.ndarray, enc2: np.ndarray) -> float:
+    """Return cosine distance between two embeddings (lower = more similar)."""
+    return float(1.0 - np.dot(enc1, enc2))
 
 
 def find_best_match(
@@ -97,67 +112,44 @@ def find_best_match(
     tolerance: float = 0.55,
     top_n: int = 5
 ) -> List[Dict]:
-    """
-    Search the database for the best matching faces.
-    Returns up to top_n results sorted by confidence (best first).
-    Each result dict contains the DB record plus 'confidence' and 'distance'.
-    """
+    """Search database for best matching faces. Returns top_n sorted by confidence."""
     if not database_records:
         return []
-
-    known_encodings = [r['encoding'] for r in database_records]
-    matches, distances = compare_faces(known_encodings, unknown_encoding, tolerance)
-
     results = []
-    for i, (record, matched, dist) in enumerate(zip(database_records, matches, distances)):
-        if matched:
+    for record in database_records:
+        enc = record.get('encoding')
+        if enc is None:
+            continue
+        dist = compare_encodings(enc, unknown_encoding)
+        if dist <= tolerance:
             confidence = max(0.0, (1.0 - dist) * 100)
             results.append({**record, 'confidence': round(confidence, 1), 'distance': dist})
-
-    # Sort by distance ascending (closest = best)
     results.sort(key=lambda x: x['distance'])
     return results[:top_n]
 
 
-def draw_faces_on_frame(frame_bgr: np.ndarray, face_locations: List, labels: List[str] = None) -> np.ndarray:
-    """Draw bounding boxes and optional labels on a BGR frame (for webcam preview)."""
-    _import_deps()
-    import cv2
-    frame = frame_bgr.copy()
-    for i, (top, right, bottom, left) in enumerate(face_locations):
-        cv2.rectangle(frame, (left, top), (right, bottom), (0, 180, 220), 2)
-        label = labels[i] if labels and i < len(labels) else ""
-        if label:
-            cv2.rectangle(frame, (left, bottom - 22), (right, bottom), (0, 120, 180), cv2.FILLED)
-            cv2.putText(frame, label, (left + 4, bottom - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-    return frame
-
-
 def resize_image_bytes(image_bytes: bytes, max_size: Tuple[int, int] = (300, 300)) -> bytes:
-    """Resize image bytes to fit within max_size, preserving aspect ratio."""
-    _import_deps()
-    import io
-    img = _PIL_Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    img.thumbnail(max_size, _PIL_Image.LANCZOS)
+    """Resize image bytes preserving aspect ratio."""
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    img.thumbnail(max_size, Image.LANCZOS)
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=85)
     return buf.getvalue()
 
 
 def array_to_qpixmap(rgb_array: np.ndarray):
-    """Convert numpy RGB array to QPixmap for display in PyQt6."""
+    """Convert numpy RGB array to QPixmap."""
     from PyQt6.QtGui import QImage, QPixmap
     h, w, ch = rgb_array.shape
-    bytes_per_line = ch * w
-    qimg = QImage(rgb_array.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+    qimg = QImage(rgb_array.data, w, h, ch * w, QImage.Format.Format_RGB888)
     return QPixmap.fromImage(qimg)
 
 
 def is_available() -> bool:
-    """Return True if all face recognition dependencies are importable."""
+    """Always True — only needs opencv which is always installed."""
     try:
-        _import_deps()
+        _load_models()
         return True
-    except ImportError:
+    except Exception as e:
+        print(f"Face engine not available: {e}")
         return False
