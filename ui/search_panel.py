@@ -1,29 +1,144 @@
 """
 ui/search_panel.py
-Left panel: query image upload / webcam capture, search controls, filter options.
+Left panel: query image upload, search controls, scan animation.
 """
 import os
+import time
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QComboBox, QSlider, QGroupBox, QFileDialog,
-    QFrame, QSizePolicy, QSpacerItem
+    QFrame
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QThread, QObject
-from PyQt6.QtGui import QPixmap
+from PyQt6.QtCore import Qt, pyqtSignal, QThread, QObject, QTimer, QRect
+from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor, QFont
 
 from .styles import *
-from .widgets import PhotoLabel, SectionHeader, PulsingDot
+from .widgets import SectionHeader, PulsingDot
+
+
+class ScanPhotoLabel(QLabel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(276, 260)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setText("CLICK TO LOAD\nQUERY IMAGE")
+        self.setStyleSheet(f"""
+            QLabel {{
+                background-color: {BG_DARKEST};
+                color: {TEXT_DIM};
+                border: 2px dashed {BORDER_LIGHT};
+                font-family: Consolas;
+                font-size: 11px;
+                letter-spacing: 2px;
+            }}
+        """)
+        self._scanning   = False
+        self._scan_y     = 0
+        self._scan_dir   = 1
+        self._grid_alpha = 40
+        self._grid_dir   = 1
+        self._timer      = QTimer()
+        self._timer.timeout.connect(self._tick)
+
+    def set_photo_path(self, path: str):
+        pix = QPixmap(path)
+        if not pix.isNull():
+            pix = pix.scaled(276, 260,
+                             Qt.AspectRatioMode.KeepAspectRatio,
+                             Qt.TransformationMode.SmoothTransformation)
+            self.setPixmap(pix)
+            self.setText("")
+            self.setStyleSheet(f"QLabel {{ background-color: {BG_DARKEST}; border: 1px solid {ACCENT_BLUE}; }}")
+
+    def clear_photo(self):
+        self.clear()
+        self.setText("CLICK TO LOAD\nQUERY IMAGE")
+        self.setStyleSheet(f"""
+            QLabel {{
+                background-color: {BG_DARKEST};
+                color: {TEXT_DIM};
+                border: 2px dashed {BORDER_LIGHT};
+                font-family: Consolas;
+                font-size: 11px;
+                letter-spacing: 2px;
+            }}
+        """)
+        self.stop_scan()
+
+    def start_scan(self):
+        self._scanning   = True
+        self._scan_y     = 0
+        self._scan_dir   = 1
+        self._grid_alpha = 40
+        self._grid_dir   = 1
+        self.setStyleSheet(f"QLabel {{ background-color: {BG_DARKEST}; border: 1px solid {ACCENT_CYAN}; }}")
+        self._timer.start(18)
+
+    def stop_scan(self):
+        self._scanning = False
+        self._timer.stop()
+        self.update()
+
+    def _tick(self):
+        self._scan_y += self._scan_dir * 4
+        if self._scan_y >= self.height():
+            self._scan_dir = -1
+        elif self._scan_y <= 0:
+            self._scan_dir = 1
+        self._grid_alpha = max(20, min(80, self._grid_alpha + self._grid_dir * 2))
+        if self._grid_alpha >= 80:
+            self._grid_dir = -1
+        elif self._grid_alpha <= 20:
+            self._grid_dir = 1
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self._scanning:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        painter.setPen(QPen(QColor(0, 200, 255, self._grid_alpha), 1))
+        for x in range(0, w, 24):
+            painter.drawLine(x, 0, x, h)
+        for y in range(0, h, 24):
+            painter.drawLine(0, y, w, y)
+        for i in range(30):
+            alpha = int(180 * (1 - i / 30))
+            y = self._scan_y - i * self._scan_dir
+            if 0 <= y <= h:
+                painter.setPen(QPen(QColor(0, 220, 255, alpha), 1))
+                painter.drawLine(0, y, w, y)
+        painter.setPen(QPen(QColor(0, 240, 255, 230), 2))
+        painter.drawLine(0, self._scan_y, w, self._scan_y)
+        painter.setPen(QPen(QColor(0, 220, 255, 230), 2))
+        m, ln = 10, 20
+        for cx, cy in [(m, m), (w-m, m), (m, h-m), (w-m, h-m)]:
+            dx = ln if cx < w // 2 else -ln
+            dy = ln if cy < h // 2 else -ln
+            painter.drawLine(cx, cy, cx + dx, cy)
+            painter.drawLine(cx, cy, cx, cy + dy)
+        cx = w // 2
+        painter.setPen(QPen(QColor(0, 255, 200, 160), 1))
+        painter.drawLine(cx - 14, self._scan_y, cx + 14, self._scan_y)
+        painter.drawLine(cx, self._scan_y - 8, cx, self._scan_y + 8)
+        painter.setPen(QPen(QColor(0, 220, 255, 200)))
+        painter.setFont(QFont("Consolas", 8))
+        painter.drawText(QRect(0, h - 20, w, 20),
+                         Qt.AlignmentFlag.AlignCenter,
+                         "ANALYZING BIOMETRICS...")
+        painter.end()
 
 
 class SearchWorker(QObject):
-    """Runs face search in a background thread."""
     finished = pyqtSignal(list)
     error    = pyqtSignal(str)
 
     def __init__(self, image_bytes: bytes, tolerance: float):
         super().__init__()
         self._bytes = image_bytes
-        self._tol = tolerance
+        self._tol   = tolerance
 
     def run(self):
         try:
@@ -31,11 +146,7 @@ class SearchWorker(QObject):
             from database.db_manager import get_all_encodings
 
             if not is_available():
-                self.error.emit(
-                    "face_recognition library not found.\n\n"
-                    "Install it with:\n  pip install face_recognition\n\n"
-                    "(Requires cmake + Visual Studio Build Tools on Windows)"
-                )
+                self.error.emit("Face engine unavailable. Check model files.")
                 return
 
             enc = encode_face_from_bytes(self._bytes)
@@ -48,27 +159,31 @@ class SearchWorker(QObject):
                 self.error.emit("No face encodings in database.\nAdd persons with photos first.")
                 return
 
+            # 5 second scan delay
+            time.sleep(5)
+
             results = find_best_match(db_records, enc, tolerance=self._tol)
             self.finished.emit(results)
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             self.error.emit(str(e))
 
 
 class SearchPanel(QWidget):
-    search_requested  = pyqtSignal(bytes, float)   # image bytes, tolerance
-    text_search       = pyqtSignal(str)
-    results_ready     = pyqtSignal(list)
-    search_error      = pyqtSignal(str)
-    status_message    = pyqtSignal(str)
+    search_requested = pyqtSignal(bytes, float)
+    text_search      = pyqtSignal(str)
+    results_ready    = pyqtSignal(list)
+    search_error     = pyqtSignal(str)
+    status_message   = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._image_bytes: bytes = None
-        self._thread = None
-        self._worker = None
+        self._image_bytes = None
+        self._thread      = None
+        self._worker      = None
         self._build_ui()
 
-    # ── Build ──────────────────────────────────────────────────────────────────
     def _build_ui(self):
         self.setFixedWidth(300)
         self.setStyleSheet(f"background-color: {BG_PANEL}; border-right: 1px solid {BORDER};")
@@ -77,39 +192,30 @@ class SearchPanel(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # Header
-        hdr = SectionHeader("  FACIAL RECOGNITION SEARCH", ACCENT_BLUE)
-        root.addWidget(hdr)
+        root.addWidget(SectionHeader("  FACIAL RECOGNITION SEARCH", ACCENT_BLUE))
 
-        # Content area
         content = QWidget()
-        content.setStyleSheet(f"background: transparent; border: none;")
+        content.setStyleSheet("background: transparent; border: none;")
         cl = QVBoxLayout(content)
         cl.setContentsMargins(12, 12, 12, 12)
         cl.setSpacing(10)
 
-        # --- Photo drop zone ---
-        self.photo_lbl = PhotoLabel("CLICK TO LOAD\nQUERY IMAGE", (276, 260))
+        self.photo_lbl = ScanPhotoLabel()
         self.photo_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
         self.photo_lbl.mousePressEvent = lambda e: self._pick_image()
         cl.addWidget(self.photo_lbl)
 
-        # Status label under photo
         self.img_status = QLabel("No image loaded")
         self.img_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.img_status.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 10px; background: transparent; border: none;")
         cl.addWidget(self.img_status)
 
-        # --- Filters group ---
         filt_group = QGroupBox("SEARCH FILTERS")
-        fg_layout = QVBoxLayout(filt_group)
-        fg_layout.setSpacing(8)
-
-        # Tolerance slider
+        fg = QVBoxLayout(filt_group)
+        fg.setSpacing(8)
         tol_lbl = QLabel("MATCH TOLERANCE")
         tol_lbl.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 10px; letter-spacing: 1px; background: transparent; border: none;")
-        fg_layout.addWidget(tol_lbl)
-
+        fg.addWidget(tol_lbl)
         tol_row = QHBoxLayout()
         self.tol_slider = QSlider(Qt.Orientation.Horizontal)
         self.tol_slider.setRange(30, 75)
@@ -117,59 +223,67 @@ class SearchPanel(QWidget):
         self.tol_val_lbl = QLabel("0.55")
         self.tol_val_lbl.setFixedWidth(32)
         self.tol_val_lbl.setStyleSheet(f"color: {ACCENT_CYAN}; font-size: 11px; background: transparent; border: none;")
-        self.tol_slider.valueChanged.connect(
-            lambda v: self.tol_val_lbl.setText(f"{v/100:.2f}")
-        )
+        self.tol_slider.valueChanged.connect(lambda v: self.tol_val_lbl.setText(f"{v/100:.2f}"))
         tol_row.addWidget(self.tol_slider, 1)
         tol_row.addWidget(self.tol_val_lbl)
-        fg_layout.addLayout(tol_row)
-
-        # Status filter
+        fg.addLayout(tol_row)
         stat_lbl = QLabel("STATUS FILTER")
         stat_lbl.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 10px; letter-spacing: 1px; background: transparent; border: none;")
-        fg_layout.addWidget(stat_lbl)
-
+        fg.addWidget(stat_lbl)
         self.status_filter = QComboBox()
         self.status_filter.addItems([
             "All Records", "Felony Warrant", "Arrest Record",
             "Under Investigation", "Interpol Notice",
             "Person of Interest", "Witness", "No Record"
         ])
-        fg_layout.addWidget(self.status_filter)
-
+        fg.addWidget(self.status_filter)
         cl.addWidget(filt_group)
 
-        # --- Text search ---
         text_group = QGroupBox("TEXT SEARCH")
-        tg_layout = QVBoxLayout(text_group)
-        tg_layout.setSpacing(6)
-
+        tg = QVBoxLayout(text_group)
+        tg.setSpacing(6)
         self.text_input = QLineEdit()
         self.text_input.setPlaceholderText("Name, ID, nationality...")
         self.text_input.returnPressed.connect(self._do_text_search)
-        tg_layout.addWidget(self.text_input)
-
+        tg.addWidget(self.text_input)
         txt_btn = QPushButton("SEARCH DATABASE")
         txt_btn.clicked.connect(self._do_text_search)
-        tg_layout.addWidget(txt_btn)
-
+        tg.addWidget(txt_btn)
         cl.addWidget(text_group)
 
         cl.addStretch()
 
-        # --- Action buttons ---
         self.search_btn = QPushButton("▶  RUN FACE SEARCH")
-        self.search_btn.setObjectName("btn_primary")
-        self.search_btn.setFixedHeight(36)
-        self.search_btn.clicked.connect(self._do_face_search)
+        self.search_btn.setFixedHeight(44)
         self.search_btn.setEnabled(False)
+        self.search_btn.clicked.connect(self._do_face_search)
+        self.search_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
+                    stop:0 #0d2a42, stop:1 #1a4a6e);
+                color: {ACCENT_CYAN};
+                border: 2px solid {ACCENT_BLUE};
+                border-radius: 4px;
+                font-family: Consolas;
+                font-size: 13px;
+                font-weight: bold;
+                letter-spacing: 3px;
+            }}
+            QPushButton:hover {{
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
+                    stop:0 {ACCENT_BLUE}, stop:1 #1a7abf);
+                color: white;
+                border-color: {ACCENT_CYAN};
+            }}
+            QPushButton:pressed {{ background: {ACCENT_CYAN}; color: {BG_DARKEST}; }}
+            QPushButton:disabled {{ background: {BG_DARKEST}; color: {TEXT_DIM}; border: 2px solid {BORDER}; }}
+        """)
         cl.addWidget(self.search_btn)
 
         self.clear_btn = QPushButton("CLEAR")
         self.clear_btn.clicked.connect(self._clear)
         cl.addWidget(self.clear_btn)
 
-        # Progress indicator
         prog_row = QHBoxLayout()
         self._dot = PulsingDot(ACCENT_AMBER)
         self._dot.hide()
@@ -181,7 +295,6 @@ class SearchPanel(QWidget):
 
         root.addWidget(content, 1)
 
-        # --- Bottom status bar ---
         status_bar = QFrame()
         status_bar.setFixedHeight(28)
         status_bar.setStyleSheet(f"""
@@ -192,18 +305,16 @@ class SearchPanel(QWidget):
                 border-radius: 0;
             }}
         """)
-        sb_layout = QHBoxLayout(status_bar)
-        sb_layout.setContentsMargins(10, 0, 10, 0)
-
+        sb = QHBoxLayout(status_bar)
+        sb.setContentsMargins(10, 0, 10, 0)
         dot = PulsingDot(ACCENT_GREEN)
         sys_lbl = QLabel("SYSTEM: ONLINE")
         sys_lbl.setStyleSheet(f"color: {ACCENT_GREEN}; font-size: 10px; background: transparent; border: none;")
-        sb_layout.addWidget(dot)
-        sb_layout.addWidget(sys_lbl)
-        sb_layout.addStretch()
+        sb.addWidget(dot)
+        sb.addWidget(sys_lbl)
+        sb.addStretch()
         root.addWidget(status_bar)
 
-    # ── Slots ──────────────────────────────────────────────────────────────────
     def _pick_image(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Select Query Image", "",
@@ -223,8 +334,10 @@ class SearchPanel(QWidget):
             return
         tol = self.tol_slider.value() / 100.0
         self.search_btn.setEnabled(False)
+        self.clear_btn.setEnabled(False)
         self._dot.show()
-        self._proc_lbl.setText("Analyzing biometrics...")
+        self._proc_lbl.setText("Scanning biometrics...")
+        self.photo_lbl.start_scan()
         self.status_message.emit("Running facial recognition scan...")
 
         self._thread = QThread()
@@ -238,21 +351,23 @@ class SearchPanel(QWidget):
         self._thread.start()
 
     def _on_results(self, results: list):
+        self.photo_lbl.stop_scan()
         self._dot.hide()
         self._proc_lbl.setText("")
         self.search_btn.setEnabled(True)
-
+        self.clear_btn.setEnabled(True)
         status = self.status_filter.currentText()
         if status != "All Records":
             results = [r for r in results if r.get('status') == status]
-
         self.results_ready.emit(results)
-        self.status_message.emit(f"{len(results)} match(es) found")
+        self.status_message.emit("1 match found" if results else "No match found")
 
     def _on_error(self, msg: str):
+        self.photo_lbl.stop_scan()
         self._dot.hide()
         self._proc_lbl.setText("")
         self.search_btn.setEnabled(True)
+        self.clear_btn.setEnabled(True)
         self.search_error.emit(msg)
         self.status_message.emit("Search error")
 
@@ -260,7 +375,6 @@ class SearchPanel(QWidget):
         q = self.text_input.text().strip()
         if q:
             self.text_search.emit(q)
-            self.status_message.emit(f"Text search: '{q}'")
 
     def _clear(self):
         self._image_bytes = None
